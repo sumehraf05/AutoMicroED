@@ -496,36 +496,26 @@ def parse_correct_lp(root: Path) -> dict:
     """
     Parse CORRECT.LP for the complete set of quality statistics.
 
-    Extracts:
-      - space_group_number
-      - unit cell: a, b, c, alpha, beta, gamma
-      - For BOTH the overall dataset and the highest-resolution shell:
-            completeness, Rmeas, I/sigma, CC½
+    Handles two CORRECT.LP formats:
+      - Standard format: numeric values without % signs
+      - Newer XDS format: values include % signs, -99.9 means not available
 
-    These are the exact statistics listed in the Week 7 assignment.
-
-    Returns a flat dict.  All values are None if CORRECT.LP is missing or
-    a field could not be parsed.
+    Returns a flat dict with space group, cell parameters, and statistics
+    for both overall and highest-resolution shell.
+    All values are None when not found or not available (-99.9).
     """
     result = {
-        # Space group and cell
         "space_group_number":   None,
         "a": None, "b": None, "c": None,
         "alpha": None, "beta": None, "gamma": None,
-
-        # Overall statistics
         "completeness_overall": None,
         "rmeas_overall":        None,
         "isigi_overall":        None,
         "cc_half_overall":      None,
-
-        # Highest-resolution shell statistics
         "completeness_hi":      None,
         "rmeas_hi":             None,
         "isigi_hi":             None,
         "cc_half_hi":           None,
-
-        # Resolution limits actually used
         "resolution_high":      None,
         "resolution_low":       None,
     }
@@ -536,12 +526,12 @@ def parse_correct_lp(root: Path) -> dict:
 
     text = lp.read_text(errors="replace")
 
-    # -- Space group --
+    # --- Space group ---
     m = re.search(r"SPACE_GROUP_NUMBER\s*=?\s*(\d+)", text)
     if m:
         result["space_group_number"] = int(m.group(1))
 
-    # -- Unit cell (from CORRECT.LP "UNIT CELL PARAMETERS" line) --
+    # --- Unit cell ---
     m = re.search(
         r"UNIT CELL PARAMETERS\s+"
         r"([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)",
@@ -551,86 +541,146 @@ def parse_correct_lp(root: Path) -> dict:
         result["a"], result["b"], result["c"] = m.group(1), m.group(2), m.group(3)
         result["alpha"], result["beta"], result["gamma"] = m.group(4), m.group(5), m.group(6)
 
-    # -- Statistics table --
-    # CORRECT.LP contains a table like:
+    def clean_val(s):
+        """Strip % sign and return float, or None if -99.9 or unparseable."""
+        if s is None:
+            return None
+        s = str(s).strip().rstrip("%").strip()
+        try:
+            v = float(s)
+            return None if v <= -99.0 else v
+        except (ValueError, TypeError):
+            return None
+
+    # --- Statistics table ---
+    # Parse every 'total' line -- XDS CORRECT writes multiple intermediate
+    # totals; we take the LAST one which is the final result.
     #
-    # SUBSET OF REFLECTIONS...
-    # ...
-    #  d(A)   #obs  #uniq  mult  %comp  <I/sI>  Rsym   Rmeas  Ranom  CC(1/2) CCano
-    #  30.00   ...
-    #   2.00   ...   <- highest-res shell (last data line before 'total')
-    #  total   ...
+    # Supported formats:
+    #   total  n_obs  n_uniq  n_poss  comp%  rsym%  rmeas%  ?  isigi  ?  cc  ...
+    #   total  n_obs  n_uniq  mult    comp   isigi  rsym    rmeas  ranom  cc
     #
-    # We parse each data line (non-header, non-total, starts with a number)
-    # and also the 'total' line.
+    # We try multiple column mappings and take the one that gives valid values.
 
-    # Regex for one statistics row:
-    # d_limit  n_obs  n_uniq  mult  comp  isigi  rsym  rmeas  ranom  cc_half  [ccano]
-    row_pat = re.compile(
-        r"^\s*([\d.]+)\s+"     # 1: d_limit (resolution in A)
-        r"\d+\s+"              # n_obs
-        r"\d+\s+"              # n_uniq
-        r"[\d.]+\s+"           # mult
-        r"([\d.]+)\s+"         # 2: % completeness
-        r"([\d.]+)\s+"         # 3: <I/sigI>
-        r"[\d.]+\s+"           # Rsym (skip -- use Rmeas)
-        r"([\d.]+)\s+"         # 4: Rmeas
-        r"[\d.]+\s+"           # Ranom (skip)
-        r"([\d.*]+)",          # 5: CC(1/2)  (may have *)
-        re.MULTILINE,
-    )
-    total_pat = re.compile(
-        r"^\s*total\s+"
-        r"\d+\s+"
-        r"\d+\s+"
-        r"[\d.]+\s+"
-        r"([\d.]+)\s+"         # 1: % completeness
-        r"([\d.]+)\s+"         # 2: <I/sigI>
-        r"[\d.]+\s+"
-        r"([\d.]+)\s+"         # 3: Rmeas
-        r"[\d.]+\s+"
-        r"([\d.*]+)",          # 4: CC(1/2)
-        re.MULTILINE | re.IGNORECASE,
-    )
+    total_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if re.match(r"^\s*total\s+\d", line, re.IGNORECASE)
+    ]
 
-    # Collect all shell rows so we can pick the highest-resolution one
-    shell_rows = []
-    for m in row_pat.finditer(text):
-        d_lim       = safe_float(m.group(1))
-        comp        = safe_float(m.group(2))
-        isigi       = safe_float(m.group(3))
-        rmeas_pct   = safe_float(m.group(4))
-        cc_str      = m.group(5).replace("*", "")
-        cc_half     = safe_float(cc_str)
-        if d_lim is not None:
-            shell_rows.append({
-                "d":      d_lim,
-                "comp":   comp,
-                "isigi":  isigi,
-                "rmeas":  rmeas_pct / 100.0 if rmeas_pct is not None else None,
-                "cc_half": cc_half / 100.0  if cc_half  is not None else None,
-            })
+    if total_lines:
+        last_total = total_lines[-1]
+        # Tokenise, stripping % signs from each token
+        tokens = [t.rstrip("%") for t in last_total.split()]
+        # tokens[0] = "total"
+        # Try to extract n_uniq, completeness, isigi, rmeas, cc_half
+        # by finding which tokens are plausible values for each field.
+        try:
+            n_uniq = int(tokens[2]) if len(tokens) > 2 else None
 
-    # Highest-resolution shell = row with smallest d value
-    if shell_rows:
-        hi_shell = min(shell_rows, key=lambda r: r["d"])
-        result["completeness_hi"] = hi_shell["comp"]
-        result["rmeas_hi"]        = hi_shell["rmeas"]
-        result["isigi_hi"]        = hi_shell["isigi"]
-        result["cc_half_hi"]      = hi_shell["cc_half"]
-        result["resolution_high"] = hi_shell["d"]
-        result["resolution_low"]  = max(r["d"] for r in shell_rows)
+            # Completeness: first token after n fields that looks like a %
+            # In the new format: tokens[4] = completeness%
+            # In the old format: tokens[4] = completeness (no %)
+            comp = None
+            for i in [4, 5, 6]:
+                if i < len(tokens):
+                    v = clean_val(tokens[i])
+                    if v is not None and 0 <= v <= 100:
+                        comp = v
+                        break
 
-    # Overall ('total') row
-    m = total_pat.search(text)
-    if m:
-        result["completeness_overall"] = safe_float(m.group(1))
-        result["isigi_overall"]        = safe_float(m.group(2))
-        rmeas_pct = safe_float(m.group(3))
-        result["rmeas_overall"]        = rmeas_pct / 100.0 if rmeas_pct is not None else None
-        cc_str = m.group(4).replace("*", "")
-        cc_val = safe_float(cc_str)
-        result["cc_half_overall"]      = cc_val / 100.0 if cc_val is not None else None
+            # Rmeas: look for a reasonable Rmeas value (usually 5-200%)
+            rmeas = None
+            # In new format: tokens[6] or tokens[5] is Rmeas%
+            for i in [6, 5, 7]:
+                if i < len(tokens):
+                    v = clean_val(tokens[i])
+                    if v is not None and 0 < v < 500:
+                        rmeas = v / 100.0  # convert % to fraction
+                        break
+
+            # I/sigma: usually a small positive number (0-100)
+            isigi = None
+            for i in [10, 9, 8, 11]:
+                if i < len(tokens):
+                    v = clean_val(tokens[i])
+                    if v is not None and -5 <= v <= 200:
+                        isigi = v
+                        break
+
+            # CC1/2: usually 0-100 or 0-1
+            cc_half = None
+            for i in [12, 13, 11, 10]:
+                if i < len(tokens):
+                    v = clean_val(tokens[i])
+                    if v is not None and 0 <= v <= 100:
+                        cc_half = v / 100.0 if v > 1.0 else v
+                        break
+
+            result["completeness_overall"] = comp
+            result["rmeas_overall"]        = rmeas
+            result["isigi_overall"]        = isigi
+            result["cc_half_overall"]      = cc_half
+
+        except (IndexError, ValueError):
+            pass
+
+    # --- Shell rows for hi-resolution stats ---
+    # Match lines starting with a resolution value (d in Angstroms)
+    shell_lines = []
+    for line in text.splitlines():
+        m = re.match(r"^\s*([\d.]+)\s+([\d]+)\s+([\d]+)\s+", line)
+        if m:
+            d = safe_float(m.group(1))
+            if d is not None and 0.5 <= d <= 50.0:
+                tokens = [t.rstrip("%") for t in line.split()]
+                shell_lines.append((d, tokens))
+
+    if shell_lines:
+        # Sort by d-spacing; smallest d = highest resolution
+        shell_lines.sort(key=lambda x: x[0])
+        result["resolution_high"] = shell_lines[0][0]
+        result["resolution_low"]  = shell_lines[-1][0]
+
+        # Use the highest-resolution shell for hi stats
+        hi_d, hi_tokens = shell_lines[0]
+        try:
+            comp_hi = None
+            for i in [4, 5, 6]:
+                if i < len(hi_tokens):
+                    v = clean_val(hi_tokens[i])
+                    if v is not None and 0 <= v <= 100:
+                        comp_hi = v
+                        break
+            rmeas_hi = None
+            for i in [6, 5, 7]:
+                if i < len(hi_tokens):
+                    v = clean_val(hi_tokens[i])
+                    if v is not None and 0 < v < 500:
+                        rmeas_hi = v / 100.0
+                        break
+            isigi_hi = None
+            for i in [10, 9, 8, 11]:
+                if i < len(hi_tokens):
+                    v = clean_val(hi_tokens[i])
+                    if v is not None and -5 <= v <= 200:
+                        isigi_hi = v
+                        break
+            cc_hi = None
+            for i in [12, 13, 11, 10]:
+                if i < len(hi_tokens):
+                    v = clean_val(hi_tokens[i])
+                    if v is not None and 0 <= v <= 100:
+                        cc_hi = v / 100.0 if v > 1.0 else v
+                        break
+            result["completeness_hi"] = comp_hi
+            result["rmeas_hi"]        = rmeas_hi
+            result["isigi_hi"]        = isigi_hi
+            result["cc_half_hi"]      = cc_hi
+        except (IndexError, ValueError):
+            pass
+
+    return result
 
     return result
 
