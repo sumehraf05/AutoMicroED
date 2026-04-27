@@ -4,18 +4,12 @@
 xds_pipeline.py
 ===============
 Automated batch processing pipeline for MicroED crystallographic datasets.
-
-Covers every requirement from the Week 6-7 assignment:
-
-  Week 6 tasks:
     1. Renumber image files starting at 1 (rerun-safe, backs up originals)
     2. Auto-generate or patch XDS.INP with per-dataset parameters from the
        image header (distance, wavelength, beam centre, data range, etc.)
     3. Loop XDS processing through all required steps automatically:
        Phase 1 -> XYCORR INIT COLSPOT IDXREF
        Phase 2 -> DEFPIX INTEGRATE CORRECT
-
-  Week 7 tasks:
     4. Recursively detect and process all dataset subdirectories in one run
     5. Extract and report full summary statistics per dataset:
          - Space group number
@@ -28,7 +22,7 @@ Covers every requirement from the Week 6-7 assignment:
        completeness while minimising Rmerge / CC½ degradation
 
 Usage:
-  python xds_pipeline.py
+  python3 xds_pipeline.py
 
 You will be prompted to drag-and-drop the parent folder containing all dataset
 subdirectories. XDS (xds_par) and XSCALE (xscale_par) must be on your PATH.
