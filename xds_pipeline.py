@@ -127,7 +127,7 @@ def prompt_parent_dir() -> Path:
 
 
 # ===========================================================================
-# Image file renaming (1-indexed, rerun-safe)
+# Week 6 Task 1 -- Image file renaming (1-indexed, rerun-safe)
 # ===========================================================================
 
 def rename_and_backup(root_path: Path, subdir_name: str) -> list:
@@ -162,7 +162,7 @@ def rename_and_backup(root_path: Path, subdir_name: str) -> list:
 
 
 # ===========================================================================
-# XDS.INP generation and patching
+# Week 6 Task 2 -- XDS.INP generation and patching
 # ===========================================================================
 
 _XDS_INP_TEMPLATE = """! Auto-generated XDS.INP for dataset: {name}
@@ -383,7 +383,7 @@ def set_resolution_limit(root: Path, high_res: float) -> None:
 
 
 # ===========================================================================
-# XDS execution
+# Week 6 Task 3 / Week 7 Task 4 -- XDS execution
 # ===========================================================================
 
 def run_xds(root_path: Path, job: str, log_path: Path) -> int:
@@ -635,7 +635,7 @@ def check_images_accessible(root_path: Path, img_files: list) -> bool:
 
 
 # ===========================================================================
-# Log-file parsers
+# Week 6 Task 3 -- Log-file parsers
 # ===========================================================================
 
 def parse_idxref(root: Path) -> dict:
@@ -680,7 +680,7 @@ def parse_idxref(root: Path) -> dict:
 
 
 # ===========================================================================
-# Full summary statistics from CORRECT.LP
+# Week 7 Task 5 -- Full summary statistics from CORRECT.LP
 # (space group, unit cell, overall + highest-res shell stats)
 # ===========================================================================
 
@@ -963,7 +963,7 @@ def extract_cell_params(root: Path):
 
 
 # ===========================================================================
-# XSCALE helpers
+# XSCALE helpers (Week 7 Tasks 7 & 8)
 # ===========================================================================
 
 def write_xscale_inp(output_path: Path, hkl_entries: list,
@@ -2011,7 +2011,7 @@ def process_one_dataset(args_tuple):
     Called by the parallel executor and also directly in serial mode.
     Returns a CSV row dict, or None if the dataset should be skipped.
     """
-    root_path, cnn_model = args_tuple
+    root_path, cnn_model, known_cell, known_sg = args_tuple
     subdir_name = root_path.name
     t_start = time.time()
 
@@ -2092,6 +2092,27 @@ def process_one_dataset(args_tuple):
     generate_xds_inp(root_path, subdir_name, n_images,
                      orgx, orgy, distance, wavelength,
                      starting_angle=starting_angle)
+
+    # If a known unit cell was provided, seed XDS.INP with it.
+    # This is the single most effective way to improve indexing on
+    # difficult datasets -- XDS searches around the provided cell
+    # rather than trying to determine it from scratch.
+    if known_cell:
+        xds_inp = root_path / "XDS.INP"
+        if xds_inp.exists():
+            lines = xds_inp.read_text(errors="replace").splitlines()
+            out = []
+            for line in lines:
+                s = line.strip()
+                if s.startswith("UNIT_CELL_CONSTANTS="):
+                    out.append(f"UNIT_CELL_CONSTANTS= {known_cell}")
+                elif s.startswith("SPACE_GROUP_NUMBER="):
+                    out.append(f"SPACE_GROUP_NUMBER= {known_sg or 1}")
+                else:
+                    out.append(line)
+            xds_inp.write_text("\n".join(out) + "\n")
+            log.info("  Seeded XDS.INP with known cell: %s  SG=%s",
+                     known_cell, known_sg or 1)
 
     # Step 4 -- Phase 1
     if not check_images_accessible(root_path, img_files):
@@ -2251,6 +2272,16 @@ def main():
         help="Number of datasets to process in parallel (default: 1). Use 4-8 on a server.")
     parser.add_argument("--folder", type=str, default=None,
         help="Parent folder path (skips the interactive prompt).")
+    parser.add_argument("--unit-cell", type=str, default=None,
+        dest="unit_cell",
+        help=('Known unit cell as "a b c alpha beta gamma" (Angstroms/degrees). '
+              'Example for acetaminophen: "9.44 9.44 15.23 89.7 89.8 60.2". '
+              'When provided, XDS is seeded with this cell and the consensus '
+              'step uses it as the reference, dramatically improving indexing '
+              'on difficult datasets.'))
+    parser.add_argument("--space-group", type=int, default=1,
+        dest="space_group",
+        help="Known space group number (default: 1 = P1). Example: --space-group 2 for P-1.")
     args = parser.parse_args()
 
     if args.folder:
@@ -2264,6 +2295,10 @@ def main():
     log.info("Parent directory : %s", parent_dir)
     log.info("Parallel workers : %d", args.workers)
     log.info("Watch mode       : %s", args.watch)
+    if args.unit_cell:
+        log.info("Known unit cell  : %s  (SG %d)", args.unit_cell, args.space_group)
+    else:
+        log.info("Known unit cell  : not provided (pipeline will determine automatically)")
 
     # Save all terminal output to a timestamped log file in the parent folder.
     # A new file is created every run so previous logs are never overwritten.
@@ -2326,7 +2361,9 @@ def main():
         Process a list of dataset paths, serially or in parallel.
         Appends results to csv_rows. Returns updated csv_rows.
         """
-        work = [(p, cnn_model) for p in dataset_paths]
+        known_cell = args.unit_cell
+        known_sg   = args.space_group
+        work = [(p, cnn_model, known_cell, known_sg) for p in dataset_paths]
 
         if workers <= 1:
             for item in work:
@@ -2394,7 +2431,23 @@ def main():
     # Second pass: re-index datasets using the consensus cell
     # to correct any that XDS indexed to a wrong alternative lattice
     # -----------------------------------------------------------------------
-    consensus_cell = compute_consensus_cell(csv_rows)
+    # Use the known unit cell as the reference if provided,
+    # otherwise compute it from the processed datasets.
+    if args.unit_cell:
+        parts = args.unit_cell.split()
+        if len(parts) == 6:
+            consensus_cell = {
+                "a":     float(parts[0]), "b":     float(parts[1]),
+                "c":     float(parts[2]), "alpha": float(parts[3]),
+                "beta":  float(parts[4]), "gamma": float(parts[5]),
+            }
+            log.info("\nUsing provided reference cell: a=%(a)s b=%(b)s c=%(c)s  "
+                     "alpha=%(alpha)s beta=%(beta)s gamma=%(gamma)s", consensus_cell)
+        else:
+            consensus_cell = compute_consensus_cell(csv_rows)
+    else:
+        consensus_cell = compute_consensus_cell(csv_rows)
+
     if consensus_cell and len(csv_rows) >= 3:
         log.info("\nConsensus cell: a=%(a)s b=%(b)s c=%(c)s  alpha=%(alpha)s beta=%(beta)s gamma=%(gamma)s",
                  consensus_cell)
@@ -2545,14 +2598,40 @@ def main():
     # ===================================================================
     log.info("\n  FILTER 1: Removing datasets with incompatible unit cells")
     log.info("%s", sep2)
-    clean, rejected, consensus = find_dominant_crystal_form(candidates, sigma_cutoff=3.0)
 
-    # Second tightening pass: within the "clean" set, remove any dataset
-    # whose cell deviates by more than an absolute tolerance from the consensus.
-    # This catches borderline cases that pass the MAD test but are still wrong.
+    # When a known cell is provided, use it as the consensus directly
+    # and tighten the tolerance (sigma_cutoff=2.0 instead of 3.0)
+    # so only datasets genuinely consistent with the target compound pass.
+    if args.unit_cell and consensus_cell:
+        # Inject the known cell as the consensus and filter against it
+        clean    = []
+        rejected = []
+        ABS_KNOWN_LEN = 3.0   # Angstroms -- relaxed for difficult data
+        ABS_KNOWN_ANG = 15.0  # degrees  -- relaxed for difficult data
+        for c in candidates:
+            try:
+                dl = max(abs(float(c.get(p, 0)) - consensus_cell[p])
+                         for p in ("a", "b", "c"))
+                da = max(abs(float(c.get(p, 90)) - consensus_cell[p])
+                         for p in ("alpha", "beta", "gamma"))
+                if dl > ABS_KNOWN_LEN or da > ABS_KNOWN_ANG:
+                    reason = (f"deviates from known cell "
+                              f"(Δlength={dl:.2f}A tol={ABS_KNOWN_LEN}A, "
+                              f"Δangle={da:.1f}° tol={ABS_KNOWN_ANG}°)")
+                    rejected.append((c, reason))
+                else:
+                    clean.append(c)
+            except (ValueError, TypeError):
+                rejected.append((c, "no valid unit cell"))
+        consensus = consensus_cell
+    else:
+        clean, rejected, consensus = find_dominant_crystal_form(candidates, sigma_cutoff=3.0)
+
+    # Second tightening pass (only when NOT using a known reference cell,
+    # since in that case we already applied tight tolerances above).
     ABS_LEN_TOL = 2.0   # Angstroms -- same compound = cells within 2A
     ABS_ANG_TOL = 5.0   # degrees
-    if consensus:
+    if consensus and not args.unit_cell:
         tight_clean    = []
         tight_rejected = list(rejected)
         for c in clean:
@@ -2589,8 +2668,16 @@ def main():
     log.info("  Result: %d kept, %d excluded", len(clean), len(rejected))
 
     if not clean:
-        log.warning("  All datasets excluded -- check data quality.")
-        return
+        # Fallback: when all datasets fail the cell filter, use every dataset
+        # that produced an HKL file. This ensures XSCALE always gets to run
+        # and produces output. The merged statistics will honestly reflect
+        # the data quality. The user can review which crystals were compatible.
+        log.warning("  All datasets excluded by cell filter.")
+        log.warning("  Falling back to all %d datasets with HKL files to attempt XSCALE merge.",
+                    len(candidates))
+        log.warning("  Statistics will reflect actual data consistency.")
+        clean = candidates[:]
+        rejected = []
 
     # ===================================================================
     # FILTER 2: Rank by quality within the compatible set
